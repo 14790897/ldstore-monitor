@@ -1,14 +1,19 @@
 {
   "name": "ldstore-monitor",
-  "version": "1.0.0",
-  "description": "监控 LD士多积分商城谷歌账号相关商品",
-  "main": "monitor.js",
+  "version": "2.0.0",
+  "description": "LD士多积分商城商品监控 - Cloudflare Worker",
+  "private": true,
   "scripts": {
-    "start": "node monitor.js"
+    "dev": "wrangler dev --test-scheduled",
+    "deploy": "wrangler deploy",
+    "generate-vapid": "node scripts/generate-vapid.js"
   },
-  "keywords": ["ldstore", "monitor"],
-  "license": "MIT",
-  "engines": {
-    "node": ">=18.0.0"
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250124.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^3.99.0"
+  },
+  "dependencies": {
+    "web-push-browser": "^0.0.3"
   }
 }

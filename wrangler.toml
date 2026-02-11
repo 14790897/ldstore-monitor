@@ -1,0 +1,18 @@
+name = "ldstore-monitor"
+main = "src/index.ts"
+compatibility_date = "2025-12-01"
+
+[assets]
+directory = "./public"
+run_worker_first = true
+
+[[kv_namespaces]]
+binding = "MONITOR_KV"
+id = "<创建后填入>"
+preview_id = "<创建后填入>"
+
+[triggers]
+crons = ["*/1 * * * *"]
+
+[vars]
+VAPID_PUBLIC_KEY = "<生成后填入>"
