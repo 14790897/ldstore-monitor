@@ -1,0 +1,14 @@
+{
+  "name": "ldstore-monitor",
+  "version": "1.0.0",
+  "description": "监控 LD士多积分商城谷歌账号相关商品",
+  "main": "monitor.js",
+  "scripts": {
+    "start": "node monitor.js"
+  },
+  "keywords": ["ldstore", "monitor"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
