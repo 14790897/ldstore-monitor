@@ -1,7 +1,9 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
+import TokenPage from './TokenPage.vue'
 
 // --- State ---
+const currentPage = ref('main')
 const keywords = ref([])
 const excludeKeywords = ref([])
 const newKeyword = ref('')
@@ -11,6 +13,7 @@ const loading = ref(false)
 const pushEnabled = ref(false)
 const pushLoading = ref(false)
 const lastCheck = ref(null)
+const tokenStatus = ref(null)
 
 // --- LocalStorage ---
 function loadConfig() {
@@ -97,6 +100,24 @@ async function fetchStatus() {
       lastCheck.value = data
     }
   } catch {}
+}
+
+// --- Token status (lightweight, for main page display) ---
+async function fetchTokenStatus() {
+  try {
+    const res = await fetch('/api/token')
+    tokenStatus.value = await res.json()
+  } catch {}
+}
+
+function tokenExpired() {
+  if (!tokenStatus.value?.exp) return false
+  return tokenStatus.value.exp * 1000 < Date.now()
+}
+
+function onTokenUpdated() {
+  fetchTokenStatus()
+  fetchProducts()
 }
 
 // --- Sync keywords to server ---
@@ -229,11 +250,20 @@ onMounted(() => {
   fetchProducts()
   fetchStatus()
   checkPushStatus()
+  fetchTokenStatus()
 })
 </script>
 
 <template>
-  <div class="max-w-2xl mx-auto px-3 py-4">
+  <!-- Token Page -->
+  <TokenPage
+    v-if="currentPage === 'token'"
+    @back="currentPage = 'main'"
+    @updated="onTokenUpdated"
+  />
+
+  <!-- Main Page -->
+  <div v-else class="max-w-2xl mx-auto px-3 py-4">
     <h1 class="text-lg font-bold text-center mb-3">LD士多 商品监控</h1>
 
     <!-- Keywords + Exclude in one card -->
@@ -269,7 +299,7 @@ onMounted(() => {
       </div>
     </div>
 
-    <!-- Push + Status in one row -->
+    <!-- Push + Status + Token in one row -->
     <div class="bg-white border border-gray-200 rounded-lg p-3 mb-2 flex items-center justify-between gap-2">
       <div class="flex items-center gap-2 text-[11px] text-gray-500 min-w-0 flex-1">
         <span v-if="lastCheck" class="truncate">
@@ -279,6 +309,13 @@ onMounted(() => {
         <span v-else>尚未检查</span>
       </div>
       <div class="flex items-center gap-1.5 shrink-0">
+        <button
+          class="px-2 py-1 border rounded text-xs disabled:opacity-50"
+          :class="tokenStatus?.hasToken
+            ? (tokenExpired() ? 'border-red-300 text-red-500 hover:bg-red-50' : 'border-green-300 text-green-600 hover:bg-green-50')
+            : 'border-gray-200 text-gray-500 hover:bg-gray-50'"
+          @click="currentPage = 'token'"
+        >Token</button>
         <button
           class="px-2 py-1 border border-gray-200 rounded text-xs text-gray-600 hover:bg-gray-50 disabled:opacity-50"
           :disabled="loading"

@@ -60,6 +60,11 @@ function cors() {
 
 // --- Fetch Products ---
 
+async function getToken(env: Env): Promise<string | null> {
+  const userToken = await env.MONITOR_KV.get("api_token");
+  return userToken || env.API_TOKEN || null;
+}
+
 async function fetchAllProducts(env: Env): Promise<Product[]> {
   const headers: Record<string, string> = {
     accept: "application/json",
@@ -68,8 +73,9 @@ async function fetchAllProducts(env: Env): Promise<Product[]> {
     referer: "https://ldst0re.qzz.io/",
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
   };
-  if (env.API_TOKEN) {
-    headers.authorization = `Bearer ${env.API_TOKEN}`;
+  const token = await getToken(env);
+  if (token) {
+    headers.authorization = `Bearer ${token}`;
   }
 
   const firstRes = await fetch(`${API_BASE}&page=1`, { headers });
@@ -186,11 +192,13 @@ async function cronCheck(env: Env) {
     updates.push({ reason, product: p, stockText });
   }
 
-  await env.MONITOR_KV.put("products", JSON.stringify(newStates));
-  await env.MONITOR_KV.put(
-    "status",
-    JSON.stringify({ timestamp: Date.now(), totalProducts: allProducts.length, updates })
-  );
+  if (updates.length > 0 || isFirstRun) {
+    await env.MONITOR_KV.put("products", JSON.stringify(newStates));
+    await env.MONITOR_KV.put(
+      "status",
+      JSON.stringify({ timestamp: Date.now(), totalProducts: allProducts.length, updates })
+    );
+  }
 
   // Push updates to matching subscribers
   for (const u of updates) {
@@ -283,6 +291,83 @@ async function handleAPI(request: Request, env: Env): Promise<Response> {
   // GET /api/vapid-public-key
   if (path === "/api/vapid-public-key" && method === "GET") {
     return json({ key: env.VAPID_PUBLIC_KEY || "" });
+  }
+
+  // POST /api/token — validate and store user token
+  if (path === "/api/token" && method === "POST") {
+    const { token } = (await request.json()) as { token: string };
+    if (!token) return json({ error: "Token is required" }, 400);
+
+    const reqHeaders = {
+      accept: "application/json",
+      "content-type": "application/json",
+      origin: "https://ldst0re.qzz.io",
+      referer: "https://ldst0re.qzz.io/",
+    };
+
+    try {
+      // Request without token
+      const noTokenRes = await fetch(`${API_BASE}&page=1`, { headers: reqHeaders });
+      const noTokenData: any = await noTokenRes.json();
+      const noTokenTotal = noTokenData.success ? noTokenData.data.pagination.total : 0;
+
+      // Request with token
+      const withTokenRes = await fetch(`${API_BASE}&page=1`, {
+        headers: { ...reqHeaders, authorization: `Bearer ${token}` },
+      });
+      const withTokenData: any = await withTokenRes.json();
+      if (!withTokenRes.ok || !withTokenData.success) {
+        return json({ error: "Token 无效，请求失败" }, 401);
+      }
+      const withTokenTotal = withTokenData.data.pagination.total;
+
+      if (withTokenTotal <= noTokenTotal) {
+        return json({ error: `Token 无效，商品数量未增加（${noTokenTotal} → ${withTokenTotal}）` }, 401);
+      }
+
+      // Check if new token has longer expiry than existing one
+      let newExp = 0;
+      try {
+        newExp = JSON.parse(atob(token.split(".")[1])).exp || 0;
+      } catch {}
+
+      const existingToken = await env.MONITOR_KV.get("api_token");
+      if (existingToken) {
+        let oldExp = 0;
+        try {
+          oldExp = JSON.parse(atob(existingToken.split(".")[1])).exp || 0;
+        } catch {}
+        if (newExp <= oldExp) {
+          return json({
+            error: `新 Token 过期时间不晚于当前 Token（当前: ${new Date(oldExp * 1000).toLocaleString("zh-CN")}，新: ${new Date(newExp * 1000).toLocaleString("zh-CN")}）`,
+          }, 400);
+        }
+      }
+
+      await env.MONITOR_KV.put("api_token", token);
+      return json({ ok: true, before: noTokenTotal, after: withTokenTotal, exp: newExp });
+    } catch {
+      return json({ error: "验证失败" }, 500);
+    }
+  }
+
+  // GET /api/token — check if user token exists
+  if (path === "/api/token" && method === "GET") {
+    const token = await env.MONITOR_KV.get("api_token");
+    if (!token) return json({ hasToken: false });
+    // Decode JWT exp to check expiry
+    try {
+      const payload = JSON.parse(atob(token.split(".")[1]));
+      return json({ hasToken: true, exp: payload.exp });
+    } catch {
+      return json({ hasToken: true });
+    }
+  }
+
+  // DELETE /api/token — remove user token
+  if (path === "/api/token" && method === "DELETE") {
+    await env.MONITOR_KV.delete("api_token");
+    return json({ ok: true });
   }
 
   return json({ error: "Not found" }, 404);
