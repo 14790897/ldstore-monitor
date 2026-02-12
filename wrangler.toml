@@ -2,17 +2,21 @@ name = "ldstore-monitor"
 main = "src/index.ts"
 compatibility_date = "2025-12-01"
 
+[[routes]]
+pattern = "monitor.sixiangjia.de"
+custom_domain = true
+
 [assets]
-directory = "./public"
+directory = "./frontend/dist"
+binding = "ASSETS"
 run_worker_first = true
 
 [[kv_namespaces]]
 binding = "MONITOR_KV"
-id = "<创建后填入>"
-preview_id = "<创建后填入>"
+id = "7580242091724758806ddab6e7c2423a"
 
 [triggers]
 crons = ["*/1 * * * *"]
 
 [vars]
-VAPID_PUBLIC_KEY = "<生成后填入>"
+VAPID_PUBLIC_KEY = "BEHG6hElkbXsD6OOWIMu6d1MKB-XPbepJ0jktD1heFh1-S3-Uphg_qJQmLdKdp1GSzGeXK9_laZLWhvdJLfsyJc"

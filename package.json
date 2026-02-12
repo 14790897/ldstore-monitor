@@ -5,15 +5,20 @@
   "private": true,
   "scripts": {
     "dev": "wrangler dev --test-scheduled",
-    "deploy": "wrangler deploy",
-    "generate-vapid": "node scripts/generate-vapid.js"
+    "deploy": "npm run build:frontend && wrangler deploy",
+    "build:frontend": "cd frontend && npm run build",
+    "generate-vapid": "node scripts/generate-vapid.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.12.11",
     "@cloudflare/workers-types": "^4.20250124.0",
     "typescript": "^5.7.0",
+    "vitest": "^3.2.4",
     "wrangler": "^3.99.0"
   },
   "dependencies": {
-    "web-push-browser": "^0.0.3"
+    "@block65/webcrypto-web-push": "^1.0.2"
   }
 }

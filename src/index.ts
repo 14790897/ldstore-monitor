@@ -1,18 +1,11 @@
-import { buildPushPayload } from "web-push-browser";
+import { buildPushPayload } from "@block65/webcrypto-web-push";
 
 export interface Env {
   MONITOR_KV: KVNamespace;
   ASSETS: Fetcher;
   VAPID_PUBLIC_KEY: string;
   VAPID_PRIVATE_KEY: string;
-  TELEGRAM_BOT_TOKEN?: string;
-  TELEGRAM_CHAT_ID?: string;
-}
-
-interface Config {
-  keywords: string[];
-  excludeKeywords: string[];
-  telegram: { bot_token: string; chat_id: string };
+  API_TOKEN: string;
 }
 
 interface ProductState {
@@ -25,72 +18,59 @@ interface Product {
   name: string;
   description: string;
   category_name: string;
+  category_icon: string;
   price: number;
   discount: number;
   stock: number;
   availableStock?: number;
   updated_at: number;
+  created_at: number;
   seller_name: string;
+  seller_avatar: string;
   product_type: string;
-}
-
-interface CheckResult {
-  timestamp: number;
-  totalProducts: number;
-  matchedCount: number;
-  updates: {
-    reason: string;
-    product: Product;
-    hasStock: boolean;
-    stockText: string;
-  }[];
+  image_url: string;
+  sold_count: number;
+  view_count: number;
 }
 
 const API_BASE =
   "https://api2.ldspro.qzz.io/api/shop/products?pageSize=50&sortBy=updated_at&sortOrder=DESC";
 
-const DEFAULT_CONFIG: Config = {
-  keywords: ["谷歌", "google", "gmail", "Google Voice", "GV", "Google Play", "Google One", "谷歌账号", "谷歌邮箱"],
-  excludeKeywords: [],
-  telegram: { bot_token: "", chat_id: "" },
-};
-
-// --- Helper Functions ---
-
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    },
   });
 }
 
-async function getConfig(kv: KVNamespace): Promise<Config> {
-  const raw = await kv.get("config");
-  if (!raw) return { ...DEFAULT_CONFIG };
-  return { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
+function cors() {
+  return new Response(null, {
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    },
+  });
 }
 
-async function getProductStates(kv: KVNamespace): Promise<Record<string, ProductState>> {
-  const raw = await kv.get("products");
-  return raw ? JSON.parse(raw) : {};
-}
+// --- Fetch Products ---
 
-function matchKeywords(text: string, keywords: string[], excludeKeywords: string[]): boolean {
-  const lower = text.toLowerCase();
-  const included = keywords.some((kw) => lower.includes(kw.toLowerCase()));
-  if (!included) return false;
-  const excluded = excludeKeywords.some((kw) => lower.includes(kw.toLowerCase()));
-  return !excluded;
-}
-
-async function fetchAllProducts(): Promise<Product[]> {
-  const headers = {
+async function fetchAllProducts(env: Env): Promise<Product[]> {
+  const headers: Record<string, string> = {
     accept: "application/json",
     "content-type": "application/json",
     origin: "https://ldst0re.qzz.io",
     referer: "https://ldst0re.qzz.io/",
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
   };
+  if (env.API_TOKEN) {
+    headers.authorization = `Bearer ${env.API_TOKEN}`;
+  }
 
   const firstRes = await fetch(`${API_BASE}&page=1`, { headers });
   if (!firstRes.ok) throw new Error(`API error: ${firstRes.status}`);
@@ -116,44 +96,55 @@ async function fetchAllProducts(): Promise<Product[]> {
   return allProducts;
 }
 
-// --- Notification Functions ---
+// --- Subscription data stored in KV ---
 
-async function sendTelegram(config: Config, text: string) {
-  const token = config.telegram.bot_token;
-  const chatId = config.telegram.chat_id;
-  if (!token || !chatId) return;
-
-  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
-  });
+interface SubscriptionData {
+  subscription: { endpoint: string; expirationTime: number | null; keys: { p256dh: string; auth: string } };
+  keywords: string[];
+  excludeKeywords: string[];
 }
 
-async function sendWebPush(env: Env, payload: string) {
+function matchesKeywords(text: string, sub: SubscriptionData): boolean {
+  if (sub.keywords.length === 0) return true;
+  const lower = text.toLowerCase();
+  const match = sub.keywords.some((kw) => lower.includes(kw.toLowerCase()));
+  const exclude = sub.excludeKeywords.some((kw) => lower.includes(kw.toLowerCase()));
+  return match && !exclude;
+}
+
+// --- Web Push ---
+
+async function sendWebPushForUpdate(
+  env: Env,
+  update: { reason: string; product: Product; stockText: string }
+) {
   if (!env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_KEY) return;
+
+  const productText = `${update.product.name} ${update.product.description} ${update.product.category_name}`;
+  const payload = JSON.stringify({
+    title: `LD士多 ${update.reason}`,
+    body: `${update.product.name} | ${update.product.price} LDC | 库存: ${update.stockText}`,
+    url: `https://ldst0re.qzz.io/product/${update.product.id}`,
+  });
 
   const list = await env.MONITOR_KV.list({ prefix: "sub:" });
   for (const key of list.keys) {
-    const subJson = await env.MONITOR_KV.get(key.name);
-    if (!subJson) continue;
+    const raw = await env.MONITOR_KV.get(key.name);
+    if (!raw) continue;
 
     try {
-      const subscription = JSON.parse(subJson);
-      const data = await buildPushPayload(
-        {
-          subscription,
-          jwt: {
-            sub: "mailto:ldstore-monitor@example.com",
-            privateKey: env.VAPID_PRIVATE_KEY,
-            publicKey: env.VAPID_PUBLIC_KEY,
-          },
-          ttl: 60,
-        },
-        payload
-      );
+      const subData: SubscriptionData = JSON.parse(raw);
+      if (!matchesKeywords(productText, subData)) continue;
 
-      const pushRes = await fetch(subscription.endpoint, data);
+      const message = { data: JSON.parse(payload), options: { ttl: 60, urgency: "high" as const } };
+      const vapid = {
+        subject: "mailto:ldstore-monitor@example.com",
+        publicKey: env.VAPID_PUBLIC_KEY,
+        privateKey: env.VAPID_PRIVATE_KEY,
+      };
+      const { headers, method, body } = await buildPushPayload(message, subData.subscription, vapid);
+
+      const pushRes = await fetch(subData.subscription.endpoint, { method, headers, body });
       if (pushRes.status === 410 || pushRes.status === 404) {
         await env.MONITOR_KV.delete(key.name);
       }
@@ -163,126 +154,130 @@ async function sendWebPush(env: Env, payload: string) {
   }
 }
 
-// --- Core Check Logic ---
+// --- Cron: detect product changes and push ---
 
-async function checkProducts(env: Env): Promise<CheckResult> {
-  const config = await getConfig(env.MONITOR_KV);
-  const prevStates = await getProductStates(env.MONITOR_KV);
+async function cronCheck(env: Env) {
+  const prevRaw = await env.MONITOR_KV.get("products");
+  const prevStates: Record<string, ProductState> = prevRaw ? JSON.parse(prevRaw) : {};
   const isFirstRun = Object.keys(prevStates).length === 0;
 
-  const allProducts = await fetchAllProducts();
+  const allProducts = await fetchAllProducts(env);
 
-  const matched = allProducts.filter((p) => {
-    const text = `${p.name} ${p.description} ${p.category_name}`;
-    return matchKeywords(text, config.keywords, config.excludeKeywords);
-  });
-
-  const updates: CheckResult["updates"] = [];
   const newStates: Record<string, ProductState> = {};
+  const updates: { reason: string; product: Product; stockText: string }[] = [];
 
-  for (const p of matched) {
+  for (const p of allProducts) {
     const hasStock = p.stock === -1 || p.stock > 0;
     const stockText = p.stock === -1 ? "无限" : `${p.availableStock ?? p.stock}`;
     const prev = prevStates[p.id];
+
+    newStates[p.id] = { hasStock, updated_at: p.updated_at };
+
+    if (isFirstRun) continue;
 
     const isNew = !prev;
     const restocked = prev && !prev.hasStock && hasStock;
     const updated = prev && prev.updated_at !== p.updated_at;
 
-    newStates[p.id] = { hasStock, updated_at: p.updated_at };
-
-    if (isFirstRun) continue;
     if (!isNew && !restocked && !updated) continue;
+    if (!hasStock) continue;
 
     const reason = isNew ? "🆕 新商品" : restocked ? "📦 补货" : "🔄 已更新";
-    updates.push({ reason, product: p, hasStock, stockText });
+    updates.push({ reason, product: p, stockText });
   }
 
-  // Save states
   await env.MONITOR_KV.put("products", JSON.stringify(newStates));
+  await env.MONITOR_KV.put(
+    "status",
+    JSON.stringify({ timestamp: Date.now(), totalProducts: allProducts.length, updates })
+  );
 
-  // Send notifications for updates with stock
+  // Push updates to matching subscribers
   for (const u of updates) {
-    if (!u.hasStock) continue;
-
-    const msg = `${u.reason} ${u.product.name}\n价格: ${u.product.price} LDC (${u.product.discount * 10}折)\n库存: ${u.stockText}\n卖家: ${u.product.seller_name}\nhttps://ldst0re.qzz.io/product/${u.product.id}`;
-
-    await sendTelegram(config, `<b>LD士多 - 商品更新!</b>\n${msg}`);
-    await sendWebPush(env, JSON.stringify({
-      title: "LD士多 - 商品更新!",
-      body: `${u.reason} ${u.product.name} | ${u.product.price} LDC | 库存: ${u.stockText}`,
-      url: `https://ldst0re.qzz.io/product/${u.product.id}`,
-    }));
+    await sendWebPushForUpdate(env, u);
   }
-
-  const result: CheckResult = {
-    timestamp: Date.now(),
-    totalProducts: allProducts.length,
-    matchedCount: matched.length,
-    updates,
-  };
-  await env.MONITOR_KV.put("status", JSON.stringify(result));
-
-  return result;
 }
 
-// --- Route Handlers ---
+// --- API Routes ---
 
 async function handleAPI(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
 
-  // GET /api/config
-  if (path === "/api/config" && method === "GET") {
-    const config = await getConfig(env.MONITOR_KV);
-    return json(config);
+  if (method === "OPTIONS") return cors();
+
+  // GET /api/products — proxy to upstream, return all products
+  if (path === "/api/products" && method === "GET") {
+    try {
+      const products = await fetchAllProducts(env);
+      return json({ success: true, products });
+    } catch (err: any) {
+      return json({ success: false, error: err.message }, 500);
+    }
   }
 
-  // PUT /api/config
-  if (path === "/api/config" && method === "PUT") {
-    const body = await request.json() as Partial<Config>;
-    const current = await getConfig(env.MONITOR_KV);
-    const updated = { ...current, ...body };
-    await env.MONITOR_KV.put("config", JSON.stringify(updated));
-    return json({ ok: true, config: updated });
+  // GET /api/status — latest cron check result
+  if (path === "/api/status" && method === "GET") {
+    const raw = await env.MONITOR_KV.get("status");
+    return json(raw ? JSON.parse(raw) : { timestamp: 0, totalProducts: 0, updates: [] });
   }
 
-  // POST /api/subscribe
+  // POST /api/subscribe — save push subscription with keywords
   if (path === "/api/subscribe" && method === "POST") {
-    const subscription = await request.json();
+    const { subscription, keywords, excludeKeywords } = (await request.json()) as {
+      subscription: any;
+      keywords: string[];
+      excludeKeywords: string[];
+    };
     const id = crypto.randomUUID();
-    await env.MONITOR_KV.put(`sub:${id}`, JSON.stringify(subscription));
+    const subData: SubscriptionData = {
+      subscription,
+      keywords: keywords || [],
+      excludeKeywords: excludeKeywords || [],
+    };
+    await env.MONITOR_KV.put(`sub:${id}`, JSON.stringify(subData));
     return json({ ok: true, id });
   }
 
-  // DELETE /api/subscribe
-  if (path === "/api/subscribe" && method === "DELETE") {
-    const { endpoint } = await request.json() as { endpoint: string };
+  // PUT /api/subscribe — update keywords for existing subscription
+  if (path === "/api/subscribe" && method === "PUT") {
+    const { endpoint, keywords, excludeKeywords } = (await request.json()) as {
+      endpoint: string;
+      keywords: string[];
+      excludeKeywords: string[];
+    };
     const list = await env.MONITOR_KV.list({ prefix: "sub:" });
     for (const key of list.keys) {
       const raw = await env.MONITOR_KV.get(key.name);
       if (raw) {
-        const sub = JSON.parse(raw);
-        if (sub.endpoint === endpoint) {
+        const subData: SubscriptionData = JSON.parse(raw);
+        if (subData.subscription.endpoint === endpoint) {
+          subData.keywords = keywords || [];
+          subData.excludeKeywords = excludeKeywords || [];
+          await env.MONITOR_KV.put(key.name, JSON.stringify(subData));
+          return json({ ok: true });
+        }
+      }
+    }
+    return json({ error: "Subscription not found" }, 404);
+  }
+
+  // DELETE /api/subscribe — remove push subscription
+  if (path === "/api/subscribe" && method === "DELETE") {
+    const { endpoint } = (await request.json()) as { endpoint: string };
+    const list = await env.MONITOR_KV.list({ prefix: "sub:" });
+    for (const key of list.keys) {
+      const raw = await env.MONITOR_KV.get(key.name);
+      if (raw) {
+        const subData: SubscriptionData = JSON.parse(raw);
+        if (subData.subscription.endpoint === endpoint) {
           await env.MONITOR_KV.delete(key.name);
           break;
         }
       }
     }
     return json({ ok: true });
-  }
-
-  // GET /api/status
-  if (path === "/api/status" && method === "GET") {
-    const status = await env.MONITOR_KV.get("status");
-    return json(status ? JSON.parse(status) : { timestamp: 0, totalProducts: 0, matchedCount: 0, updates: [] });
-  }
-
-  // POST /api/check
-  if (path === "/api/check" && method === "POST") {
-    const result = await checkProducts(env);
-    return json(result);
   }
 
   // GET /api/vapid-public-key
@@ -293,21 +288,20 @@ async function handleAPI(request: Request, env: Env): Promise<Response> {
   return json({ error: "Not found" }, 404);
 }
 
-// --- Worker Entry ---
+export { matchesKeywords, json, cors };
+
+// --- Entry ---
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-
     if (url.pathname.startsWith("/api/")) {
       return handleAPI(request, env);
     }
-
-    // Fallback to static assets
     return env.ASSETS.fetch(request);
   },
 
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(checkProducts(env));
+    ctx.waitUntil(cronCheck(env));
   },
 };
