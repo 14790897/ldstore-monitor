@@ -4,9 +4,13 @@
 
 [![Test](https://github.com/14790897/ldstore-monitor/actions/workflows/test.yml/badge.svg)](https://github.com/14790897/ldstore-monitor/actions/workflows/test.yml)
 
+🔗 **在线地址**：[monitor.sixiangjia.de](https://monitor.sixiangjia.de)
+| 📦 **GitHub**：[14790897/ldstore-monitor](https://github.com/14790897/ldstore-monitor)
+| 🤖 **Telegram Bot**：[@ldstore_monitor_bot](https://t.me/ldstore_monitor_bot)
+
 ## 特性
 
-- **自动监控** — Cloudflare Worker Cron 定时扫描全部商品
+- **自动监控** — Cloudflare Worker Cron 每分钟扫描全部商品
 - **精准推送** — 每个订阅者独立关键词/排除词，仅推送匹配的变动（Web Push + Telegram）
 - **智能过滤** — 仅在新上架、补货、信息更新时通知，首次运行静默
 - **Token 共享** — 用户可提交登录 Token，解锁更多商品数据
@@ -16,7 +20,7 @@
 
 ```
 ┌─────────────────────────────┐
-│     LD士多 商品监控          │
+│     LD士多 商品监控  🐙 ✈️    │
 │  ┌───────────────────────┐  │
 │  │ 匹配关键词  [京东] [E卡] │  │
 │  │ 排除关键词  [测试]      │  │
@@ -89,20 +93,21 @@ npx wrangler secret put TELEGRAM_BOT_TOKEN
 curl "https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://monitor.sixiangjia.de/api/telegram/webhook"
 ```
 
-用户通过 Bot 命令管理订阅：
+用户通过 [@ldstore_monitor_bot](https://t.me/ldstore_monitor_bot) 管理订阅：
 - `/start` — 开始订阅
 - `/subscribe 京东 E卡` — 设置匹配关键词
 - `/exclude 测试` — 设置排除关键词
 - `/status` — 查看当前设置
 - `/unsubscribe` — 取消订阅
+- `/help` — 查看帮助
 
-### 5. 部署
+### 6. 部署
 
 ```bash
 npm run deploy
 ```
 
-### 6. 本地开发
+### 7. 本地开发
 
 ```bash
 npm run dev
@@ -111,7 +116,7 @@ npm run dev
 - 前端：`http://localhost:8787`
 - 手动触发 Cron：`http://localhost:8787/__scheduled`
 
-### 7. 测试
+### 8. 测试
 
 ```bash
 npm test           # 运行所有测试
