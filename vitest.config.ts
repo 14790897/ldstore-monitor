@@ -11,6 +11,7 @@ export default defineWorkersConfig({
           bindings: {
             VAPID_PUBLIC_KEY: "test-public-key",
             VAPID_PRIVATE_KEY: "test-private-key",
+            TELEGRAM_BOT_TOKEN: "test-bot-token",
           },
         },
       },

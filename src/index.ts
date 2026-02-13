@@ -6,6 +6,7 @@ export interface Env {
   VAPID_PUBLIC_KEY: string;
   VAPID_PRIVATE_KEY: string;
   API_TOKEN: string;
+  TELEGRAM_BOT_TOKEN: string;
 }
 
 interface ProductState {
@@ -104,13 +105,20 @@ async function fetchAllProducts(env: Env): Promise<Product[]> {
 
 // --- Subscription data stored in KV ---
 
-interface SubscriptionData {
-  subscription: { endpoint: string; expirationTime: number | null; keys: { p256dh: string; auth: string } };
+interface KeywordFilter {
   keywords: string[];
   excludeKeywords: string[];
 }
 
-function matchesKeywords(text: string, sub: SubscriptionData): boolean {
+interface SubscriptionData extends KeywordFilter {
+  subscription: { endpoint: string; expirationTime: number | null; keys: { p256dh: string; auth: string } };
+}
+
+interface TelegramSubscriptionData extends KeywordFilter {
+  chatId: number;
+}
+
+function matchesKeywords(text: string, sub: KeywordFilter): boolean {
   if (sub.keywords.length === 0) return true;
   const lower = text.toLowerCase();
   const match = sub.keywords.some((kw) => lower.includes(kw.toLowerCase()));
@@ -160,6 +168,147 @@ async function sendWebPushForUpdate(
   }
 }
 
+// --- Telegram ---
+
+async function sendTelegram(env: Env, chatId: number, text: string) {
+  try {
+    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
+    });
+  } catch {
+    // Telegram API unreachable
+  }
+}
+
+async function sendTelegramForUpdate(
+  env: Env,
+  update: { reason: string; product: Product; stockText: string }
+) {
+  if (!env.TELEGRAM_BOT_TOKEN) return;
+
+  const productText = `${update.product.name} ${update.product.description} ${update.product.category_name}`;
+  const message =
+    `${update.reason}\n` +
+    `<b>${update.product.name}</b>\n` +
+    `💰 ${update.product.price} LDC | 📦 库存: ${update.stockText}\n` +
+    `https://ldst0re.qzz.io/product/${update.product.id}`;
+
+  const list = await env.MONITOR_KV.list({ prefix: "tg:" });
+  for (const key of list.keys) {
+    const raw = await env.MONITOR_KV.get(key.name);
+    if (!raw) continue;
+
+    try {
+      const subData: TelegramSubscriptionData = JSON.parse(raw);
+      if (!matchesKeywords(productText, subData)) continue;
+
+      const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: subData.chatId, text: message, parse_mode: "HTML" }),
+      });
+      if (res.status === 403 || res.status === 400) {
+        await env.MONITOR_KV.delete(key.name);
+      }
+    } catch {
+      // skip failed subscription
+    }
+  }
+}
+
+async function handleTelegramWebhook(request: Request, env: Env): Promise<Response> {
+  if (!env.TELEGRAM_BOT_TOKEN) return json({ error: "Telegram not configured" }, 500);
+
+  const body: any = await request.json();
+  const msg = body.message;
+  if (!msg?.text || !msg?.chat?.id) return json({ ok: true });
+
+  const chatId: number = msg.chat.id;
+  const text: string = msg.text.trim();
+  const [cmd, ...args] = text.split(/\s+/);
+
+  switch (cmd) {
+    case "/start": {
+      const existing = await env.MONITOR_KV.get(`tg:${chatId}`);
+      if (!existing) {
+        const subData: TelegramSubscriptionData = { chatId, keywords: [], excludeKeywords: [] };
+        await env.MONITOR_KV.put(`tg:${chatId}`, JSON.stringify(subData));
+      }
+      await sendTelegram(env, chatId,
+        "✅ 已订阅 LD士多商品监控\n\n" +
+        "当前设置：接收所有商品通知\n\n" +
+        "可用命令：\n" +
+        "/subscribe 关键词1 关键词2 — 设置匹配关键词\n" +
+        "/exclude 关键词1 关键词2 — 设置排除关键词\n" +
+        "/status — 查看当前设置\n" +
+        "/unsubscribe — 取消订阅"
+      );
+      break;
+    }
+
+    case "/subscribe": {
+      if (args.length === 0) {
+        await sendTelegram(env, chatId, "用法：/subscribe 京东 E卡 Steam\n多个关键词用空格分隔");
+        break;
+      }
+      const raw = await env.MONITOR_KV.get(`tg:${chatId}`);
+      const subData: TelegramSubscriptionData = raw ? JSON.parse(raw) : { chatId, keywords: [], excludeKeywords: [] };
+      subData.keywords = args;
+      await env.MONITOR_KV.put(`tg:${chatId}`, JSON.stringify(subData));
+      await sendTelegram(env, chatId, `✅ 匹配关键词已更新：${args.join("、")}`);
+      break;
+    }
+
+    case "/exclude": {
+      if (args.length === 0) {
+        await sendTelegram(env, chatId, "用法：/exclude 测试 pro\n多个关键词用空格分隔");
+        break;
+      }
+      const raw = await env.MONITOR_KV.get(`tg:${chatId}`);
+      const subData: TelegramSubscriptionData = raw ? JSON.parse(raw) : { chatId, keywords: [], excludeKeywords: [] };
+      subData.excludeKeywords = args;
+      await env.MONITOR_KV.put(`tg:${chatId}`, JSON.stringify(subData));
+      await sendTelegram(env, chatId, `✅ 排除关键词已更新：${args.join("、")}`);
+      break;
+    }
+
+    case "/unsubscribe": {
+      await env.MONITOR_KV.delete(`tg:${chatId}`);
+      await sendTelegram(env, chatId, "已取消订阅，不再接收通知。\n发送 /start 可重新订阅。");
+      break;
+    }
+
+    case "/status": {
+      const raw = await env.MONITOR_KV.get(`tg:${chatId}`);
+      if (!raw) {
+        await sendTelegram(env, chatId, "未订阅。发送 /start 开始订阅。");
+      } else {
+        const subData: TelegramSubscriptionData = JSON.parse(raw);
+        const kw = subData.keywords.length > 0 ? subData.keywords.join("、") : "全部（未设置）";
+        const ex = subData.excludeKeywords.length > 0 ? subData.excludeKeywords.join("、") : "无";
+        await sendTelegram(env, chatId, `📋 当前设置\n匹配关键词：${kw}\n排除关键词：${ex}`);
+      }
+      break;
+    }
+
+    case "/help": {
+      await sendTelegram(env, chatId,
+        "LD士多商品监控 Bot\n\n" +
+        "/start — 开始订阅\n" +
+        "/subscribe 关键词 — 设置匹配关键词\n" +
+        "/exclude 关键词 — 设置排除关键词\n" +
+        "/status — 查看当前设置\n" +
+        "/unsubscribe — 取消订阅"
+      );
+      break;
+    }
+  }
+
+  return json({ ok: true });
+}
+
 // --- Cron: detect product changes and push ---
 
 async function cronCheck(env: Env) {
@@ -203,6 +352,7 @@ async function cronCheck(env: Env) {
   // Push updates to matching subscribers
   for (const u of updates) {
     await sendWebPushForUpdate(env, u);
+    await sendTelegramForUpdate(env, u);
   }
 }
 
@@ -286,6 +436,11 @@ async function handleAPI(request: Request, env: Env): Promise<Response> {
       }
     }
     return json({ ok: true });
+  }
+
+  // POST /api/telegram/webhook — handle Telegram Bot updates
+  if (path === "/api/telegram/webhook" && method === "POST") {
+    return handleTelegramWebhook(request, env);
   }
 
   // GET /api/vapid-public-key
@@ -373,7 +528,7 @@ async function handleAPI(request: Request, env: Env): Promise<Response> {
   return json({ error: "Not found" }, 404);
 }
 
-export { matchesKeywords, json, cors };
+export { matchesKeywords, json, cors, handleTelegramWebhook };
 
 // --- Entry ---
 
