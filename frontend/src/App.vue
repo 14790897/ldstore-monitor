@@ -8,6 +8,8 @@ const keywords = ref([])
 const excludeKeywords = ref([])
 const newKeyword = ref('')
 const newExclude = ref('')
+const targetPrice = ref(null)
+const priceInput = ref('')
 const products = ref([])
 const loading = ref(false)
 const pushEnabled = ref(false)
@@ -23,6 +25,8 @@ function loadConfig() {
       const config = JSON.parse(raw)
       keywords.value = config.keywords || []
       excludeKeywords.value = config.excludeKeywords || []
+      targetPrice.value = config.targetPrice ?? null
+      priceInput.value = targetPrice.value != null ? String(targetPrice.value) : ''
     }
   } catch {}
 }
@@ -31,6 +35,7 @@ function saveConfig() {
   localStorage.setItem('ldstore-config', JSON.stringify({
     keywords: keywords.value,
     excludeKeywords: excludeKeywords.value,
+    targetPrice: targetPrice.value,
   }))
   syncKeywordsToServer()
 }
@@ -61,6 +66,24 @@ function addExclude() {
 
 function removeExclude(kw) {
   excludeKeywords.value = excludeKeywords.value.filter(k => k !== kw)
+  saveConfig()
+}
+
+// --- Price alert ---
+function setPrice() {
+  const val = parseFloat(priceInput.value)
+  if (!priceInput.value || isNaN(val) || val <= 0) {
+    targetPrice.value = null
+    priceInput.value = ''
+  } else {
+    targetPrice.value = val
+  }
+  saveConfig()
+}
+
+function clearPrice() {
+  targetPrice.value = null
+  priceInput.value = ''
   saveConfig()
 }
 
@@ -135,6 +158,7 @@ async function syncKeywordsToServer() {
         endpoint: sub.endpoint,
         keywords: keywords.value,
         excludeKeywords: excludeKeywords.value,
+        targetPrice: targetPrice.value,
       }),
     })
   } catch (err) {
@@ -216,6 +240,7 @@ async function togglePush() {
           subscription: sub.toJSON(),
           keywords: keywords.value,
           excludeKeywords: excludeKeywords.value,
+          targetPrice: targetPrice.value,
         }),
       })
 
@@ -304,6 +329,20 @@ onMounted(() => {
         <span v-for="kw in excludeKeywords" :key="kw" class="inline-flex items-center gap-0.5 px-2 py-0.5 bg-red-50 text-red-500 rounded-full text-[11px] font-medium">
           {{ kw }}<button class="opacity-50 hover:opacity-100 text-sm leading-none" @click="removeExclude(kw)">&times;</button>
         </span>
+      </div>
+      <div class="flex gap-2 mt-2">
+        <input
+          v-model="priceInput"
+          type="number"
+          placeholder="价格提醒阈值 (LDC)"
+          class="flex-1 px-2 py-1 border border-gray-200 rounded text-xs outline-none focus:border-amber-500"
+          @keyup.enter="setPrice"
+        />
+        <button class="px-2.5 py-1 bg-amber-500 text-white text-xs rounded hover:bg-amber-600" @click="setPrice">设置</button>
+        <button v-if="targetPrice != null" class="px-2.5 py-1 border border-gray-200 text-gray-500 text-xs rounded hover:bg-gray-50" @click="clearPrice">清除</button>
+      </div>
+      <div class="text-[11px] mt-1" :class="targetPrice != null ? 'text-amber-600' : 'text-gray-400'">
+        {{ targetPrice != null ? `匹配商品 ≤ ${targetPrice} LDC 时通知` : '未设置价格提醒' }}
       </div>
     </div>
 

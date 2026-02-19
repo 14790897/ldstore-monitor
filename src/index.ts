@@ -108,6 +108,8 @@ async function fetchAllProducts(env: Env): Promise<Product[]> {
 interface KeywordFilter {
   keywords: string[];
   excludeKeywords: string[];
+  targetPrice?: number;
+  notifiedProducts?: number[]; // product IDs already notified for price alert
 }
 
 interface SubscriptionData extends KeywordFilter {
@@ -242,6 +244,8 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
         "可用命令：\n" +
         "/subscribe 关键词1 关键词2 — 设置匹配关键词\n" +
         "/exclude 关键词1 关键词2 — 设置排除关键词\n" +
+        "/setprice 价格 — 设置价格提醒（匹配商品低于此价格时通知）\n" +
+        "/delprice — 取消价格提醒\n" +
         "/status — 查看当前设置\n" +
         "/unsubscribe — 取消订阅"
       );
@@ -280,6 +284,35 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
       break;
     }
 
+    case "/setprice": {
+      const price = parseFloat(args[0]);
+      if (!args[0] || isNaN(price) || price <= 0) {
+        await sendTelegram(env, chatId, "用法：/setprice 100\n当匹配的商品价格 ≤ 该值时通知你");
+        break;
+      }
+      const raw = await env.MONITOR_KV.get(`tg:${chatId}`);
+      const subData: TelegramSubscriptionData = raw ? JSON.parse(raw) : { chatId, keywords: [], excludeKeywords: [] };
+      subData.targetPrice = price;
+      subData.notifiedProducts = [];
+      await env.MONITOR_KV.put(`tg:${chatId}`, JSON.stringify(subData));
+      await sendTelegram(env, chatId, `✅ 价格提醒已设置：匹配商品 ≤ ${price} LDC 时通知`);
+      break;
+    }
+
+    case "/delprice": {
+      const raw = await env.MONITOR_KV.get(`tg:${chatId}`);
+      if (!raw) {
+        await sendTelegram(env, chatId, "未订阅。发送 /start 开始订阅。");
+        break;
+      }
+      const subData: TelegramSubscriptionData = JSON.parse(raw);
+      delete subData.targetPrice;
+      delete subData.notifiedProducts;
+      await env.MONITOR_KV.put(`tg:${chatId}`, JSON.stringify(subData));
+      await sendTelegram(env, chatId, "✅ 价格提醒已取消");
+      break;
+    }
+
     case "/status": {
       const raw = await env.MONITOR_KV.get(`tg:${chatId}`);
       if (!raw) {
@@ -288,7 +321,8 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
         const subData: TelegramSubscriptionData = JSON.parse(raw);
         const kw = subData.keywords.length > 0 ? subData.keywords.join("、") : "全部（未设置）";
         const ex = subData.excludeKeywords.length > 0 ? subData.excludeKeywords.join("、") : "无";
-        await sendTelegram(env, chatId, `📋 当前设置\n匹配关键词：${kw}\n排除关键词：${ex}`);
+        const priceInfo = subData.targetPrice != null ? `${subData.targetPrice} LDC` : "未设置";
+        await sendTelegram(env, chatId, `📋 当前设置\n匹配关键词：${kw}\n排除关键词：${ex}\n💰 价格提醒：${priceInfo}`);
       }
       break;
     }
@@ -299,6 +333,8 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
         "/start — 开始订阅\n" +
         "/subscribe 关键词 — 设置匹配关键词\n" +
         "/exclude 关键词 — 设置排除关键词\n" +
+        "/setprice 价格 — 设置价格提醒\n" +
+        "/delprice — 取消价格提醒\n" +
         "/status — 查看当前设置\n" +
         "/unsubscribe — 取消订阅"
       );
@@ -307,6 +343,124 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
   }
 
   return json({ ok: true });
+}
+
+// --- Price Alert Check ---
+
+async function checkPriceAlerts(env: Env, allProducts: Product[]) {
+  const productMap = new Map<number, Product>();
+  for (const p of allProducts) {
+    productMap.set(p.id, p);
+  }
+
+  // Check Telegram subscribers
+  if (env.TELEGRAM_BOT_TOKEN) {
+    const list = await env.MONITOR_KV.list({ prefix: "tg:" });
+    for (const key of list.keys) {
+      const raw = await env.MONITOR_KV.get(key.name);
+      if (!raw) continue;
+
+      try {
+        const subData: TelegramSubscriptionData = JSON.parse(raw);
+        if (subData.targetPrice == null) continue;
+
+        const notified = new Set(subData.notifiedProducts || []);
+        const newNotified: number[] = [];
+        let changed = false;
+
+        for (const p of allProducts) {
+          const productText = `${p.name} ${p.description} ${p.category_name}`;
+          if (!matchesKeywords(productText, subData)) continue;
+
+          const hasStock = p.stock === -1 || p.stock > 0;
+          if (!hasStock) continue;
+
+          if (p.price <= subData.targetPrice) {
+            newNotified.push(p.id);
+            if (!notified.has(p.id)) {
+              // New price alert — send notification
+              changed = true;
+              const stockText = p.stock === -1 ? "无限" : `${p.availableStock ?? p.stock}`;
+              const message =
+                `💰 价格提醒\n` +
+                `<b>${p.name}</b>\n` +
+                `当前价格: ${p.price} LDC ≤ ${subData.targetPrice} LDC\n` +
+                `📦 库存: ${stockText}\n` +
+                `https://ldst0re.qzz.io/product/${p.id}`;
+              await sendTelegram(env, subData.chatId, message);
+            }
+          }
+        }
+
+        // Update notifiedProducts if changed (new alerts or products went above price)
+        const prevSet = subData.notifiedProducts || [];
+        if (changed || newNotified.length !== prevSet.length || !newNotified.every((id) => notified.has(id))) {
+          subData.notifiedProducts = newNotified;
+          await env.MONITOR_KV.put(key.name, JSON.stringify(subData));
+        }
+      } catch {
+        // skip failed subscription
+      }
+    }
+  }
+
+  // Check Web Push subscribers
+  if (env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY) {
+    const list = await env.MONITOR_KV.list({ prefix: "sub:" });
+    for (const key of list.keys) {
+      const raw = await env.MONITOR_KV.get(key.name);
+      if (!raw) continue;
+
+      try {
+        const subData: SubscriptionData = JSON.parse(raw);
+        if (subData.targetPrice == null) continue;
+
+        const notified = new Set(subData.notifiedProducts || []);
+        const newNotified: number[] = [];
+        let changed = false;
+
+        for (const p of allProducts) {
+          const productText = `${p.name} ${p.description} ${p.category_name}`;
+          if (!matchesKeywords(productText, subData)) continue;
+
+          const hasStock = p.stock === -1 || p.stock > 0;
+          if (!hasStock) continue;
+
+          if (p.price <= subData.targetPrice) {
+            newNotified.push(p.id);
+            if (!notified.has(p.id)) {
+              changed = true;
+              const stockText = p.stock === -1 ? "无限" : `${p.availableStock ?? p.stock}`;
+              const payload = JSON.stringify({
+                title: "LD士多 💰 价格提醒",
+                body: `${p.name} | ${p.price} LDC ≤ ${subData.targetPrice} LDC | 库存: ${stockText}`,
+                url: `https://ldst0re.qzz.io/product/${p.id}`,
+              });
+              const message = { data: JSON.parse(payload), options: { ttl: 60, urgency: "high" as const } };
+              const vapid = {
+                subject: "mailto:ldstore-monitor@example.com",
+                publicKey: env.VAPID_PUBLIC_KEY,
+                privateKey: env.VAPID_PRIVATE_KEY,
+              };
+              const { headers, method, body } = await buildPushPayload(message, subData.subscription, vapid);
+              const pushRes = await fetch(subData.subscription.endpoint, { method, headers, body });
+              if (pushRes.status === 410 || pushRes.status === 404) {
+                await env.MONITOR_KV.delete(key.name);
+              }
+            }
+          }
+        }
+
+        const prevSet = subData.notifiedProducts || [];
+        if (changed || newNotified.length !== prevSet.length || !newNotified.every((id) => notified.has(id))) {
+          subData.notifiedProducts = newNotified;
+          await env.MONITOR_KV.put(key.name, JSON.stringify(subData));
+        }
+      } catch {
+        // skip failed subscription
+      }
+    }
+  }
 }
 
 // --- Cron: detect product changes and push ---
@@ -354,6 +508,11 @@ async function cronCheck(env: Env) {
     await sendWebPushForUpdate(env, u);
     await sendTelegramForUpdate(env, u);
   }
+
+  // Price alert check for Telegram subscribers
+  if (!isFirstRun) {
+    await checkPriceAlerts(env, allProducts);
+  }
 }
 
 // --- API Routes ---
@@ -383,16 +542,18 @@ async function handleAPI(request: Request, env: Env): Promise<Response> {
 
   // POST /api/subscribe — save push subscription with keywords
   if (path === "/api/subscribe" && method === "POST") {
-    const { subscription, keywords, excludeKeywords } = (await request.json()) as {
+    const { subscription, keywords, excludeKeywords, targetPrice } = (await request.json()) as {
       subscription: any;
       keywords: string[];
       excludeKeywords: string[];
+      targetPrice?: number;
     };
     const id = crypto.randomUUID();
     const subData: SubscriptionData = {
       subscription,
       keywords: keywords || [],
       excludeKeywords: excludeKeywords || [],
+      targetPrice: targetPrice ?? undefined,
     };
     await env.MONITOR_KV.put(`sub:${id}`, JSON.stringify(subData));
     return json({ ok: true, id });
@@ -400,10 +561,11 @@ async function handleAPI(request: Request, env: Env): Promise<Response> {
 
   // PUT /api/subscribe — update keywords for existing subscription
   if (path === "/api/subscribe" && method === "PUT") {
-    const { endpoint, keywords, excludeKeywords } = (await request.json()) as {
+    const { endpoint, keywords, excludeKeywords, targetPrice } = (await request.json()) as {
       endpoint: string;
       keywords: string[];
       excludeKeywords: string[];
+      targetPrice?: number;
     };
     const list = await env.MONITOR_KV.list({ prefix: "sub:" });
     for (const key of list.keys) {
@@ -413,6 +575,11 @@ async function handleAPI(request: Request, env: Env): Promise<Response> {
         if (subData.subscription.endpoint === endpoint) {
           subData.keywords = keywords || [];
           subData.excludeKeywords = excludeKeywords || [];
+          const oldPrice = subData.targetPrice;
+          subData.targetPrice = targetPrice ?? undefined;
+          if (oldPrice !== subData.targetPrice) {
+            subData.notifiedProducts = [];
+          }
           await env.MONITOR_KV.put(key.name, JSON.stringify(subData));
           return json({ ok: true });
         }
