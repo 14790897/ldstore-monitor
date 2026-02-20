@@ -130,44 +130,19 @@ function matchesKeywords(text: string, sub: KeywordFilter): boolean {
 
 // --- Web Push ---
 
-async function sendWebPushForUpdate(
+async function sendWebPush(
   env: Env,
-  update: { reason: string; product: Product; stockText: string }
+  subData: SubscriptionData,
+  payload: string
 ) {
-  if (!env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_KEY) return;
-
-  const productText = `${update.product.name} ${update.product.description} ${update.product.category_name}`;
-  const payload = JSON.stringify({
-    title: `LD士多 ${update.reason}`,
-    body: `${update.product.name} | ${update.product.price} LDC | 库存: ${update.stockText}`,
-    url: `https://ldst0re.qzz.io/product/${update.product.id}`,
-  });
-
-  const list = await env.MONITOR_KV.list({ prefix: "sub:" });
-  for (const key of list.keys) {
-    const raw = await env.MONITOR_KV.get(key.name);
-    if (!raw) continue;
-
-    try {
-      const subData: SubscriptionData = JSON.parse(raw);
-      if (!matchesKeywords(productText, subData)) continue;
-
-      const message = { data: JSON.parse(payload), options: { ttl: 60, urgency: "high" as const } };
-      const vapid = {
-        subject: "mailto:ldstore-monitor@example.com",
-        publicKey: env.VAPID_PUBLIC_KEY,
-        privateKey: env.VAPID_PRIVATE_KEY,
-      };
-      const { headers, method, body } = await buildPushPayload(message, subData.subscription, vapid);
-
-      const pushRes = await fetch(subData.subscription.endpoint, { method, headers, body });
-      if (pushRes.status === 410 || pushRes.status === 404) {
-        await env.MONITOR_KV.delete(key.name);
-      }
-    } catch {
-      // skip failed subscription
-    }
-  }
+  const message = { data: JSON.parse(payload), options: { ttl: 60, urgency: "high" as const } };
+  const vapid = {
+    subject: "mailto:ldstore-monitor@example.com",
+    publicKey: env.VAPID_PUBLIC_KEY,
+    privateKey: env.VAPID_PRIVATE_KEY,
+  };
+  const { headers, method, body } = await buildPushPayload(message, subData.subscription, vapid);
+  return fetch(subData.subscription.endpoint, { method, headers, body });
 }
 
 // --- Telegram ---
@@ -181,42 +156,6 @@ async function sendTelegram(env: Env, chatId: number, text: string) {
     });
   } catch {
     // Telegram API unreachable
-  }
-}
-
-async function sendTelegramForUpdate(
-  env: Env,
-  update: { reason: string; product: Product; stockText: string }
-) {
-  if (!env.TELEGRAM_BOT_TOKEN) return;
-
-  const productText = `${update.product.name} ${update.product.description} ${update.product.category_name}`;
-  const message =
-    `${update.reason}\n` +
-    `<b>${update.product.name}</b>\n` +
-    `💰 ${update.product.price} LDC | 📦 库存: ${update.stockText}\n` +
-    `https://ldst0re.qzz.io/product/${update.product.id}`;
-
-  const list = await env.MONITOR_KV.list({ prefix: "tg:" });
-  for (const key of list.keys) {
-    const raw = await env.MONITOR_KV.get(key.name);
-    if (!raw) continue;
-
-    try {
-      const subData: TelegramSubscriptionData = JSON.parse(raw);
-      if (!matchesKeywords(productText, subData)) continue;
-
-      const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: subData.chatId, text: message, parse_mode: "HTML" }),
-      });
-      if (res.status === 403 || res.status === 400) {
-        await env.MONITOR_KV.delete(key.name);
-      }
-    } catch {
-      // skip failed subscription
-    }
   }
 }
 
@@ -345,57 +284,84 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
   return json({ ok: true });
 }
 
-// --- Price Alert Check ---
+// --- Notify all subscribers (updates + price alerts) in one pass ---
 
-async function checkPriceAlerts(env: Env, allProducts: Product[]) {
-  const productMap = new Map<number, Product>();
-  for (const p of allProducts) {
-    productMap.set(p.id, p);
-  }
+async function notifySubscribers(
+  env: Env,
+  updates: { reason: string; product: Product; stockText: string }[],
+  allProducts: Product[]
+) {
+  // Single list to get all subscription keys (tg: and sub:)
+  const allKeys = await env.MONITOR_KV.list();
+  const tgKeys = allKeys.keys.filter((k) => k.name.startsWith("tg:"));
+  const subKeys = allKeys.keys.filter((k) => k.name.startsWith("sub:"));
 
-  // Check Telegram subscribers
+  // Telegram subscribers
   if (env.TELEGRAM_BOT_TOKEN) {
-    const list = await env.MONITOR_KV.list({ prefix: "tg:" });
-    for (const key of list.keys) {
+    for (const key of tgKeys) {
       const raw = await env.MONITOR_KV.get(key.name);
       if (!raw) continue;
 
       try {
         const subData: TelegramSubscriptionData = JSON.parse(raw);
-        if (subData.targetPrice == null) continue;
+        let needPut = false;
 
-        const notified = new Set(subData.notifiedProducts || []);
-        const newNotified: number[] = [];
-        let changed = false;
-
-        for (const p of allProducts) {
-          const productText = `${p.name} ${p.description} ${p.category_name}`;
+        // 1) Send update notifications (new/restock/updated)
+        for (const u of updates) {
+          const productText = `${u.product.name} ${u.product.description} ${u.product.category_name}`;
           if (!matchesKeywords(productText, subData)) continue;
 
-          const hasStock = p.stock === -1 || p.stock > 0;
-          if (!hasStock) continue;
-
-          if (p.price <= subData.targetPrice) {
-            newNotified.push(p.id);
-            if (!notified.has(p.id)) {
-              // New price alert — send notification
-              changed = true;
-              const stockText = p.stock === -1 ? "无限" : `${p.availableStock ?? p.stock}`;
-              const message =
-                `💰 价格提醒\n` +
-                `<b>${p.name}</b>\n` +
-                `当前价格: ${p.price} LDC ≤ ${subData.targetPrice} LDC\n` +
-                `📦 库存: ${stockText}\n` +
-                `https://ldst0re.qzz.io/product/${p.id}`;
-              await sendTelegram(env, subData.chatId, message);
-            }
+          const message =
+            `${u.reason}\n` +
+            `<b>${u.product.name}</b>\n` +
+            `💰 ${u.product.price} LDC | 📦 库存: ${u.stockText}\n` +
+            `https://ldst0re.qzz.io/product/${u.product.id}`;
+          const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_id: subData.chatId, text: message, parse_mode: "HTML" }),
+          });
+          if (res.status === 403 || res.status === 400) {
+            await env.MONITOR_KV.delete(key.name);
+            break;
           }
         }
 
-        // Update notifiedProducts if changed (new alerts or products went above price)
-        const prevSet = subData.notifiedProducts || [];
-        if (changed || newNotified.length !== prevSet.length || !newNotified.every((id) => notified.has(id))) {
-          subData.notifiedProducts = newNotified;
+        // 2) Price alert check
+        if (subData.targetPrice != null) {
+          const notified = new Set(subData.notifiedProducts || []);
+          const newNotified: number[] = [];
+
+          for (const p of allProducts) {
+            const productText = `${p.name} ${p.description} ${p.category_name}`;
+            if (!matchesKeywords(productText, subData)) continue;
+            const hasStock = p.stock === -1 || p.stock > 0;
+            if (!hasStock) continue;
+
+            if (p.price <= subData.targetPrice) {
+              newNotified.push(p.id);
+              if (!notified.has(p.id)) {
+                needPut = true;
+                const stockText = p.stock === -1 ? "无限" : `${p.availableStock ?? p.stock}`;
+                const message =
+                  `💰 价格提醒\n` +
+                  `<b>${p.name}</b>\n` +
+                  `当前价格: ${p.price} LDC ≤ ${subData.targetPrice} LDC\n` +
+                  `📦 库存: ${stockText}\n` +
+                  `https://ldst0re.qzz.io/product/${p.id}`;
+                await sendTelegram(env, subData.chatId, message);
+              }
+            }
+          }
+
+          const prevSet = subData.notifiedProducts || [];
+          if (needPut || newNotified.length !== prevSet.length || !newNotified.every((id) => notified.has(id))) {
+            subData.notifiedProducts = newNotified;
+            needPut = true;
+          }
+        }
+
+        if (needPut) {
           await env.MONITOR_KV.put(key.name, JSON.stringify(subData));
         }
       } catch {
@@ -404,56 +370,78 @@ async function checkPriceAlerts(env: Env, allProducts: Product[]) {
     }
   }
 
-  // Check Web Push subscribers
+  // Web Push subscribers
   if (env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY) {
-    const list = await env.MONITOR_KV.list({ prefix: "sub:" });
-    for (const key of list.keys) {
+    for (const key of subKeys) {
       const raw = await env.MONITOR_KV.get(key.name);
       if (!raw) continue;
 
       try {
         const subData: SubscriptionData = JSON.parse(raw);
-        if (subData.targetPrice == null) continue;
+        let needPut = false;
+        let deleted = false;
 
-        const notified = new Set(subData.notifiedProducts || []);
-        const newNotified: number[] = [];
-        let changed = false;
-
-        for (const p of allProducts) {
-          const productText = `${p.name} ${p.description} ${p.category_name}`;
+        // 1) Send update notifications
+        for (const u of updates) {
+          const productText = `${u.product.name} ${u.product.description} ${u.product.category_name}`;
           if (!matchesKeywords(productText, subData)) continue;
 
-          const hasStock = p.stock === -1 || p.stock > 0;
-          if (!hasStock) continue;
+          const payload = JSON.stringify({
+            title: `LD士多 ${u.reason}`,
+            body: `${u.product.name} | ${u.product.price} LDC | 库存: ${u.stockText}`,
+            url: `https://ldst0re.qzz.io/product/${u.product.id}`,
+          });
+          const pushRes = await sendWebPush(env, subData, payload);
+          if (pushRes.status === 410 || pushRes.status === 404) {
+            await env.MONITOR_KV.delete(key.name);
+            deleted = true;
+            break;
+          }
+        }
 
-          if (p.price <= subData.targetPrice) {
-            newNotified.push(p.id);
-            if (!notified.has(p.id)) {
-              changed = true;
-              const stockText = p.stock === -1 ? "无限" : `${p.availableStock ?? p.stock}`;
-              const payload = JSON.stringify({
-                title: "LD士多 💰 价格提醒",
-                body: `${p.name} | ${p.price} LDC ≤ ${subData.targetPrice} LDC | 库存: ${stockText}`,
-                url: `https://ldst0re.qzz.io/product/${p.id}`,
-              });
-              const message = { data: JSON.parse(payload), options: { ttl: 60, urgency: "high" as const } };
-              const vapid = {
-                subject: "mailto:ldstore-monitor@example.com",
-                publicKey: env.VAPID_PUBLIC_KEY,
-                privateKey: env.VAPID_PRIVATE_KEY,
-              };
-              const { headers, method, body } = await buildPushPayload(message, subData.subscription, vapid);
-              const pushRes = await fetch(subData.subscription.endpoint, { method, headers, body });
-              if (pushRes.status === 410 || pushRes.status === 404) {
-                await env.MONITOR_KV.delete(key.name);
+        if (deleted) continue;
+
+        // 2) Price alert check
+        if (subData.targetPrice != null) {
+          const notified = new Set(subData.notifiedProducts || []);
+          const newNotified: number[] = [];
+
+          for (const p of allProducts) {
+            const productText = `${p.name} ${p.description} ${p.category_name}`;
+            if (!matchesKeywords(productText, subData)) continue;
+            const hasStock = p.stock === -1 || p.stock > 0;
+            if (!hasStock) continue;
+
+            if (p.price <= subData.targetPrice) {
+              newNotified.push(p.id);
+              if (!notified.has(p.id)) {
+                needPut = true;
+                const stockText = p.stock === -1 ? "无限" : `${p.availableStock ?? p.stock}`;
+                const payload = JSON.stringify({
+                  title: "LD士多 💰 价格提醒",
+                  body: `${p.name} | ${p.price} LDC ≤ ${subData.targetPrice} LDC | 库存: ${stockText}`,
+                  url: `https://ldst0re.qzz.io/product/${p.id}`,
+                });
+                const pushRes = await sendWebPush(env, subData, payload);
+                if (pushRes.status === 410 || pushRes.status === 404) {
+                  await env.MONITOR_KV.delete(key.name);
+                  deleted = true;
+                  break;
+                }
               }
+            }
+          }
+
+          if (!deleted) {
+            const prevSet = subData.notifiedProducts || [];
+            if (needPut || newNotified.length !== prevSet.length || !newNotified.every((id) => notified.has(id))) {
+              subData.notifiedProducts = newNotified;
+              needPut = true;
             }
           }
         }
 
-        const prevSet = subData.notifiedProducts || [];
-        if (changed || newNotified.length !== prevSet.length || !newNotified.every((id) => notified.has(id))) {
-          subData.notifiedProducts = newNotified;
+        if (!deleted && needPut) {
           await env.MONITOR_KV.put(key.name, JSON.stringify(subData));
         }
       } catch {
@@ -503,15 +491,9 @@ async function cronCheck(env: Env) {
     );
   }
 
-  // Push updates to matching subscribers
-  for (const u of updates) {
-    await sendWebPushForUpdate(env, u);
-    await sendTelegramForUpdate(env, u);
-  }
-
-  // Price alert check for Telegram subscribers
+  // Notify all subscribers in one pass (updates + price alerts)
   if (!isFirstRun) {
-    await checkPriceAlerts(env, allProducts);
+    await notifySubscribers(env, updates, allProducts);
   }
 }
 
