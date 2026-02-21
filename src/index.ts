@@ -310,6 +310,8 @@ async function notifySubscribers(
         for (const u of updates) {
           const productText = `${u.product.name} ${u.product.description} ${u.product.category_name}`;
           if (!matchesKeywords(productText, subData)) continue;
+          // If targetPrice is set, only notify for products <= targetPrice
+          if (subData.targetPrice != null && u.product.price > subData.targetPrice) continue;
 
           const message =
             `${u.reason}\n` +
@@ -385,6 +387,8 @@ async function notifySubscribers(
         for (const u of updates) {
           const productText = `${u.product.name} ${u.product.description} ${u.product.category_name}`;
           if (!matchesKeywords(productText, subData)) continue;
+          // If targetPrice is set, only notify for products <= targetPrice
+          if (subData.targetPrice != null && u.product.price > subData.targetPrice) continue;
 
           const payload = JSON.stringify({
             title: `LD士多 ${u.reason}`,
