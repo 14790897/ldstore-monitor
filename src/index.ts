@@ -307,25 +307,26 @@ async function notifySubscribers(
         let needPut = false;
 
         // 1) Send update notifications (new/restock/updated)
-        for (const u of updates) {
-          const productText = `${u.product.name} ${u.product.description} ${u.product.category_name}`;
-          if (!matchesKeywords(productText, subData)) continue;
-          // If targetPrice is set, only notify for products <= targetPrice
-          if (subData.targetPrice != null && u.product.price > subData.targetPrice) continue;
+        // Skip if targetPrice is set - only use price alerts in that case
+        if (subData.targetPrice == null) {
+          for (const u of updates) {
+            const productText = `${u.product.name} ${u.product.description} ${u.product.category_name}`;
+            if (!matchesKeywords(productText, subData)) continue;
 
-          const message =
-            `${u.reason}\n` +
-            `<b>${u.product.name}</b>\n` +
-            `💰 ${u.product.price} LDC | 📦 库存: ${u.stockText}\n` +
-            `https://ldst0re.qzz.io/product/${u.product.id}`;
-          const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ chat_id: subData.chatId, text: message, parse_mode: "HTML" }),
-          });
-          if (res.status === 403 || res.status === 400) {
-            await env.MONITOR_KV.delete(key.name);
-            break;
+            const message =
+              `${u.reason}\n` +
+              `<b>${u.product.name}</b>\n` +
+              `💰 ${u.product.price} LDC | 📦 库存: ${u.stockText}\n` +
+              `https://ldst0re.qzz.io/product/${u.product.id}`;
+            const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ chat_id: subData.chatId, text: message, parse_mode: "HTML" }),
+            });
+            if (res.status === 403 || res.status === 400) {
+              await env.MONITOR_KV.delete(key.name);
+              break;
+            }
           }
         }
 
@@ -384,22 +385,23 @@ async function notifySubscribers(
         let deleted = false;
 
         // 1) Send update notifications
-        for (const u of updates) {
-          const productText = `${u.product.name} ${u.product.description} ${u.product.category_name}`;
-          if (!matchesKeywords(productText, subData)) continue;
-          // If targetPrice is set, only notify for products <= targetPrice
-          if (subData.targetPrice != null && u.product.price > subData.targetPrice) continue;
+        // Skip if targetPrice is set - only use price alerts in that case
+        if (subData.targetPrice == null) {
+          for (const u of updates) {
+            const productText = `${u.product.name} ${u.product.description} ${u.product.category_name}`;
+            if (!matchesKeywords(productText, subData)) continue;
 
-          const payload = JSON.stringify({
-            title: `LD士多 ${u.reason}`,
-            body: `${u.product.name} | ${u.product.price} LDC | 库存: ${u.stockText}`,
-            url: `https://ldst0re.qzz.io/product/${u.product.id}`,
-          });
-          const pushRes = await sendWebPush(env, subData, payload);
-          if (pushRes.status === 410 || pushRes.status === 404) {
-            await env.MONITOR_KV.delete(key.name);
-            deleted = true;
-            break;
+            const payload = JSON.stringify({
+              title: `LD士多 ${u.reason}`,
+              body: `${u.product.name} | ${u.product.price} LDC | 库存: ${u.stockText}`,
+              url: `https://ldst0re.qzz.io/product/${u.product.id}`,
+            });
+            const pushRes = await sendWebPush(env, subData, payload);
+            if (pushRes.status === 410 || pushRes.status === 404) {
+              await env.MONITOR_KV.delete(key.name);
+              deleted = true;
+              break;
+            }
           }
         }
 
