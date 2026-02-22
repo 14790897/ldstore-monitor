@@ -284,6 +284,94 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
   return json({ ok: true });
 }
 
+// --- Core notification logic (shared by Telegram and Web Push) ---
+
+interface NotificationCallbacks {
+  sendUpdate: (
+    product: Product,
+    reason: string,
+    stockText: string,
+  ) => Promise<boolean>; // returns true if should stop (subscriber deleted)
+  sendPriceAlert: (
+    product: Product,
+    stockText: string,
+    targetPrice: number,
+  ) => Promise<boolean>; // returns true if should stop
+}
+
+async function processSubscriberNotifications(
+  subData: KeywordFilter,
+  updates: { reason: string; product: Product; stockText: string }[],
+  allProducts: Product[],
+  callbacks: NotificationCallbacks,
+): Promise<{ needPut: boolean; updatedNotifiedProducts?: number[] }> {
+  let needPut = false;
+  let stopped = false;
+
+  // 1) Send update notifications (new/restock/updated)
+  // Skip if targetPrice is set - only use price alerts in that case
+  if (subData.targetPrice == null && !stopped) {
+    for (const u of updates) {
+      const productText = `${u.product.name} ${u.product.description} ${u.product.category_name}`;
+      if (!matchesKeywords(productText, subData)) continue;
+
+      const shouldStop = await callbacks.sendUpdate(
+        u.product,
+        u.reason,
+        u.stockText,
+      );
+      if (shouldStop) {
+        stopped = true;
+        break;
+      }
+    }
+  }
+
+  // 2) Price alert check
+  if (subData.targetPrice != null && !stopped) {
+    const notified = new Set(subData.notifiedProducts || []);
+    const newNotified: number[] = [];
+
+    for (const p of allProducts) {
+      const productText = `${p.name} ${p.description} ${p.category_name}`;
+      if (!matchesKeywords(productText, subData)) continue;
+      const hasStock = p.stock === -1 || p.stock > 0;
+      if (!hasStock) continue;
+
+      if (p.price <= subData.targetPrice) {
+        newNotified.push(p.id);
+        if (!notified.has(p.id)) {
+          needPut = true;
+          const stockText =
+            p.stock === -1 ? "无限" : `${p.availableStock ?? p.stock}`;
+          const shouldStop = await callbacks.sendPriceAlert(
+            p,
+            stockText,
+            subData.targetPrice,
+          );
+          if (shouldStop) {
+            stopped = true;
+            break;
+          }
+        }
+      }
+    }
+
+    const prevSet = subData.notifiedProducts || [];
+    if (
+      needPut ||
+      newNotified.length !== prevSet.length ||
+      !newNotified.every((id) => notified.has(id))
+    ) {
+      needPut = true;
+    }
+
+    return { needPut, updatedNotifiedProducts: newNotified };
+  }
+
+  return { needPut };
+}
+
 // --- Notify all subscribers (updates + price alerts) in one pass ---
 
 async function notifySubscribers(
@@ -304,20 +392,14 @@ async function notifySubscribers(
 
       try {
         const subData: TelegramSubscriptionData = JSON.parse(raw);
-        let needPut = false;
 
-        // 1) Send update notifications (new/restock/updated)
-        // Skip if targetPrice is set - only use price alerts in that case
-        if (subData.targetPrice == null) {
-          for (const u of updates) {
-            const productText = `${u.product.name} ${u.product.description} ${u.product.category_name}`;
-            if (!matchesKeywords(productText, subData)) continue;
-
+        const callbacks: NotificationCallbacks = {
+          sendUpdate: async (product, reason, stockText) => {
             const message =
-              `${u.reason}\n` +
-              `<b>${u.product.name}</b>\n` +
-              `💰 ${u.product.price} LDC | 📦 库存: ${u.stockText}\n` +
-              `https://ldst0re.qzz.io/product/${u.product.id}`;
+              `${reason}\n` +
+              `<b>${product.name}</b>\n` +
+              `💰 ${product.price} LDC | 📦 库存: ${stockText}\n` +
+              `https://ldst0re.qzz.io/product/${product.id}`;
             const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -325,46 +407,28 @@ async function notifySubscribers(
             });
             if (res.status === 403 || res.status === 400) {
               await env.MONITOR_KV.delete(key.name);
-              break;
+              return true; // stop processing
             }
+            return false;
+          },
+          sendPriceAlert: async (product, stockText, targetPrice) => {
+            const message =
+              `💰 价格提醒\n` +
+              `<b>${product.name}</b>\n` +
+              `当前价格: ${product.price} LDC ≤ ${targetPrice} LDC\n` +
+              `📦 库存: ${stockText}\n` +
+              `https://ldst0re.qzz.io/product/${product.id}`;
+            await sendTelegram(env, subData.chatId, message);
+            return false;
+          },
+        };
+
+        const result = await processSubscriberNotifications(subData, updates, allProducts, callbacks);
+
+        if (result.needPut) {
+          if (result.updatedNotifiedProducts) {
+            subData.notifiedProducts = result.updatedNotifiedProducts;
           }
-        }
-
-        // 2) Price alert check
-        if (subData.targetPrice != null) {
-          const notified = new Set(subData.notifiedProducts || []);
-          const newNotified: number[] = [];
-
-          for (const p of allProducts) {
-            const productText = `${p.name} ${p.description} ${p.category_name}`;
-            if (!matchesKeywords(productText, subData)) continue;
-            const hasStock = p.stock === -1 || p.stock > 0;
-            if (!hasStock) continue;
-
-            if (p.price <= subData.targetPrice) {
-              newNotified.push(p.id);
-              if (!notified.has(p.id)) {
-                needPut = true;
-                const stockText = p.stock === -1 ? "无限" : `${p.availableStock ?? p.stock}`;
-                const message =
-                  `💰 价格提醒\n` +
-                  `<b>${p.name}</b>\n` +
-                  `当前价格: ${p.price} LDC ≤ ${subData.targetPrice} LDC\n` +
-                  `📦 库存: ${stockText}\n` +
-                  `https://ldst0re.qzz.io/product/${p.id}`;
-                await sendTelegram(env, subData.chatId, message);
-              }
-            }
-          }
-
-          const prevSet = subData.notifiedProducts || [];
-          if (needPut || newNotified.length !== prevSet.length || !newNotified.every((id) => notified.has(id))) {
-            subData.notifiedProducts = newNotified;
-            needPut = true;
-          }
-        }
-
-        if (needPut) {
           await env.MONITOR_KV.put(key.name, JSON.stringify(subData));
         }
       } catch {
@@ -381,73 +445,50 @@ async function notifySubscribers(
 
       try {
         const subData: SubscriptionData = JSON.parse(raw);
-        let needPut = false;
         let deleted = false;
 
-        // 1) Send update notifications
-        // Skip if targetPrice is set - only use price alerts in that case
-        if (subData.targetPrice == null) {
-          for (const u of updates) {
-            const productText = `${u.product.name} ${u.product.description} ${u.product.category_name}`;
-            if (!matchesKeywords(productText, subData)) continue;
-
+        const callbacks: NotificationCallbacks = {
+          sendUpdate: async (product, reason, stockText) => {
             const payload = JSON.stringify({
-              title: `LD士多 ${u.reason}`,
-              body: `${u.product.name} | ${u.product.price} LDC | 库存: ${u.stockText}`,
-              url: `https://ldst0re.qzz.io/product/${u.product.id}`,
+              title: `LD士多 ${reason}`,
+              body: `${product.name} | ${product.price} LDC | 库存: ${stockText}`,
+              url: `https://ldst0re.qzz.io/product/${product.id}`,
             });
             const pushRes = await sendWebPush(env, subData, payload);
             if (pushRes.status === 410 || pushRes.status === 404) {
               await env.MONITOR_KV.delete(key.name);
               deleted = true;
-              break;
+              return true; // stop processing
             }
-          }
-        }
-
-        if (deleted) continue;
-
-        // 2) Price alert check
-        if (subData.targetPrice != null) {
-          const notified = new Set(subData.notifiedProducts || []);
-          const newNotified: number[] = [];
-
-          for (const p of allProducts) {
-            const productText = `${p.name} ${p.description} ${p.category_name}`;
-            if (!matchesKeywords(productText, subData)) continue;
-            const hasStock = p.stock === -1 || p.stock > 0;
-            if (!hasStock) continue;
-
-            if (p.price <= subData.targetPrice) {
-              newNotified.push(p.id);
-              if (!notified.has(p.id)) {
-                needPut = true;
-                const stockText = p.stock === -1 ? "无限" : `${p.availableStock ?? p.stock}`;
-                const payload = JSON.stringify({
-                  title: "LD士多 💰 价格提醒",
-                  body: `${p.name} | ${p.price} LDC ≤ ${subData.targetPrice} LDC | 库存: ${stockText}`,
-                  url: `https://ldst0re.qzz.io/product/${p.id}`,
-                });
-                const pushRes = await sendWebPush(env, subData, payload);
-                if (pushRes.status === 410 || pushRes.status === 404) {
-                  await env.MONITOR_KV.delete(key.name);
-                  deleted = true;
-                  break;
-                }
-              }
+            return false;
+          },
+          sendPriceAlert: async (product, stockText, targetPrice) => {
+            const payload = JSON.stringify({
+              title: "LD士多 💰 价格提醒",
+              body: `${product.name} | ${product.price} LDC ≤ ${targetPrice} LDC | 库存: ${stockText}`,
+              url: `https://ldst0re.qzz.io/product/${product.id}`,
+            });
+            const pushRes = await sendWebPush(env, subData, payload);
+            if (pushRes.status === 410 || pushRes.status === 404) {
+              await env.MONITOR_KV.delete(key.name);
+              deleted = true;
+              return true; // stop processing
             }
-          }
+            return false;
+          },
+        };
 
-          if (!deleted) {
-            const prevSet = subData.notifiedProducts || [];
-            if (needPut || newNotified.length !== prevSet.length || !newNotified.every((id) => notified.has(id))) {
-              subData.notifiedProducts = newNotified;
-              needPut = true;
-            }
-          }
-        }
+        const result = await processSubscriberNotifications(
+          subData,
+          updates,
+          allProducts,
+          callbacks,
+        );
 
-        if (!deleted && needPut) {
+        if (!deleted && result.needPut) {
+          if (result.updatedNotifiedProducts) {
+            subData.notifiedProducts = result.updatedNotifiedProducts;
+          }
           await env.MONITOR_KV.put(key.name, JSON.stringify(subData));
         }
       } catch {
