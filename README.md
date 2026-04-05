@@ -122,6 +122,11 @@ npm run dev
 npm test           # 运行所有测试
 npm run test:watch # 监听模式
 ```
+### 9.停止·
+
+```bash
+npx wrangler delete ldstore-monitor
+```
 
 ## 通知触发条件
 

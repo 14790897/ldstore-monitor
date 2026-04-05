@@ -16,7 +16,7 @@ binding = "MONITOR_KV"
 id = "7580242091724758806ddab6e7c2423a"
 
 [triggers]
-crons = ["*/1 * * * *"]
+crons = ["*/40 * * * *"]
 
 [vars]
 VAPID_PUBLIC_KEY = "BEHG6hElkbXsD6OOWIMu6d1MKB-XPbepJ0jktD1heFh1-S3-Uphg_qJQmLdKdp1GSzGeXK9_laZLWhvdJLfsyJc"
